@@ -1,7 +1,6 @@
 # auth-spring — Architecture Plan
 
-*Version 3.0 · Clean Layered Architecture · Production-Ready*
-*Spring Boot 4.0.6 · Java 25 · Critical Revision*
+*Spring Boot 4.0.6 · Java 25 · Module-Layered Architecture · Production-Ready*
 
 | Property | Value |
 |---|---|
@@ -13,212 +12,73 @@
 | Java | `25` (LTS) |
 | Database | PostgreSQL 16+ |
 | JWT Library | JJWT `0.12.x` |
-| Architecture | Clean Layered — Domain · Application · Infrastructure · Web |
+| Architecture | Module-Layered — entity · repository · service · usecase · web |
 | License | MIT |
-
----
-
-## 0. Critical Architecture Analysis of Previous Version
-
-This section documents every architectural defect found in v2.0, ranked by severity. Each problem is explained with its root cause and the correction applied in v3.0.
-
-### 0.1 Problem Inventory (Ranked by Severity)
-
----
-
-#### ❶ CRITICAL — Security Configuration Trapped Inside a Feature Module
-
-**Problem:** `SecurityConfig.java`, `JwtAuthenticationFilter.java`, and `StarterPermissionEvaluator.java` are located at `auth/infrastructure/security/`. These three classes are **not auth-specific**. They govern the entire HTTP security filter chain for the whole application. `StarterPermissionEvaluator` evaluates permissions from the **rbac** module. `JwtAuthenticationFilter` applies to every controller, not just auth controllers.
-
-**Consequence:** If you ever split `rbac` into a separate module, or add a new feature module, the security infrastructure sits inside a different module, creating an invisible coupling. Any developer reading `rbac/web/RoleController.java` has no obvious path to understand what secures it.
-
-**Fix in v3.0:** Move `SecurityConfig`, `JwtAuthenticationFilter`, and `StarterPermissionEvaluator` to `shared/security/`. Security is cross-cutting by definition.
-
----
-
-#### ❷ CRITICAL — `OpenApiConfig` in the Wrong Package
-
-**Problem:** `OpenApiConfig.java` was placed inside `auth/infrastructure/security/`. OpenAPI/Swagger configuration has nothing to do with authentication infrastructure. It configures API documentation for the entire application.
-
-**Consequence:** Misleads every developer who reads the folder. OpenAPI is not a security concern and it is not an auth concern.
-
-**Fix in v3.0:** Move to `shared/config/OpenApiConfig.java`.
-
----
-
-#### ❸ CRITICAL — Cross-Module Repository Access (Boundary Violation)
-
-**Problem:** `RoleService.java` (in `rbac/application/`) directly injects `UserJpaRepository` (from `auth/infrastructure/persistence/`). This is a hard boundary violation: the **rbac** application layer reaches into the **auth** infrastructure layer of another module.
-
-```
-rbac/application/RoleService  →  auth/infrastructure/persistence/UserJpaRepository
-                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                FORBIDDEN: crosses module + layer boundaries
-```
-
-**Consequence:** Any change to `UserJpaRepository` or `UserEntity` can silently break `RoleService`. The modules are not independent.
-
-**Fix in v3.0:** Introduce `UserRoleAssignmentPort` — an interface defined in `rbac/application/port/`. The `auth` infrastructure layer provides the adapter that implements it. Direction of dependency is inverted: rbac defines what it needs, auth fulfils the contract.
-
----
-
-#### ❹ HIGH — Domain Events Owned by the Consumer, Not the Publisher
-
-**Problem:** `UserRegisteredEvent`, `UserLoggedInEvent`, `RoleCreatedEvent`, etc. all live in `audit/event/`. This means `auth/application/AuthService` must **import from `audit/`** to publish `UserRegisteredEvent`. The `rbac/application/RoleService` must **import from `audit/`** to publish `RoleCreatedEvent`.
-
-```
-auth/application/AuthService  →  audit/event/UserRegisteredEvent   ← WRONG direction
-rbac/application/RoleService  →  audit/event/RoleCreatedEvent      ← WRONG direction
-```
-
-**Consequence:** Feature modules depend on the audit module. Adding an audit module to a greenfield feature requires touching that feature's source files. Removing audit becomes impossible without breaking auth and rbac.
-
-**Fix in v3.0:** Events live in the **publishing** module, in an `event/` sub-package. `auth/event/` contains auth-related events. `rbac/event/` contains rbac-related events. The `audit` module depends on these packages — not the reverse.
-
-```
-audit/application/AuditEventListener  →  auth/event/UserRegisteredEvent   ← CORRECT
-audit/application/AuditEventListener  →  rbac/event/RoleCreatedEvent       ← CORRECT
-```
-
----
-
-#### ❺ HIGH — `AuthService` Violates Single Responsibility (God Class)
-
-**Problem:** `AuthService` contains five distinct use cases: `login`, `register`, `logout`, `refreshTokens`, and `me`. Each use case has different dependencies, different transaction scopes, and different failure modes.
-
-**Consequence:** Every dependency needed by any one use case is visible to every other. Testing `register` requires mocking JWT infrastructure. A change to the refresh flow forces a recompile of the login flow.
-
-**Fix in v3.0:** One class per use case. `LoginUseCase`, `RegisterUseCase`, `LogoutUseCase`, `RefreshTokensUseCase`, `GetProfileUseCase`. Each injects only the dependencies it actually needs.
-
----
-
-#### ❻ HIGH — Missing `UserRoleService` (Incomplete Feature)
-
-**Problem:** The architecture defined a `UserRoleController` with POST/DELETE endpoints for assigning roles to users. No corresponding application service was specified in the implementation plan. The controller has nothing to call.
-
-**Fix in v3.0:** `UserRoleService` is fully specified.
-
----
-
-#### ❼ MEDIUM — Permission Name Validation in Application Layer (Wrong Layer)
-
-**Problem:** `PermissionService` contains `Pattern NAME_PATTERN = Pattern.compile("^[a-z_]+:[a-z_*]+$")` and validates it. Format validation of a domain concept (`resource:action` format) is a **domain rule**, not an application orchestration concern.
-
-**Fix in v3.0:** Introduce `PermissionName` as a value object in `rbac/domain/`. The value object self-validates on construction. `PermissionService` never sees raw strings for permission names.
-
----
-
-#### ❽ MEDIUM — Unsafe JSON Construction in AuditEventListener
-
-**Problem:**
-```java
-"{\"email\":\"" + event.email() + "\"}"    // string concatenation → injection vector
-"{\"name\":\"" + event.roleName() + "\"}"   // not escaped, breaks on special chars
-```
-
-**Fix in v3.0:** Inject `ObjectMapper` into `AuditEventListener`. Use `objectMapper.writeValueAsString(Map.of(...))` for all metadata fields.
-
----
-
-#### ❾ MEDIUM — Java 21 Features Not Leveraged (Version Upgrade)
-
-**Problem:** The codebase targets Java 21 LTS with Spring Boot 3.5.0. The user requires Java 25 with Spring Boot 4.0.6. Several Java 25 features improve correctness and clarity:
-- Virtual threads (Project Loom — stable since Java 21) for the async audit listener executor
-- Pattern matching `switch` (stable since Java 21) for exception handler dispatch
-- Sealed interfaces for the exception hierarchy (stable since Java 17)
-- `@Async` default executor should use virtual threads
-
-**Fix in v3.0:** All changes documented in the implementation plan.
-
----
-
-#### ❿ LOW — Lombok as a Dependency (Java 25 Makes It Redundant)
-
-**Problem:** Lombok is listed as a dependency. On Java 25, `record` covers `@Value`, `@Data` (immutable), and parameter objects. Annotation processor compatibility with Java 25 must be verified per release.
-
-**Fix in v3.0:** Lombok is retained **only** for JPA entities (which cannot be records — JPA requires mutable state and no-arg constructors). All DTOs, value objects, events, and response types use `record`. This reduces the Lombok surface to `@Getter`, `@Setter`, `@NoArgsConstructor`, `@AllArgsConstructor` on entity classes only.
-
----
-
-### 0.2 Boundary Violation Map
-
-The diagram below shows every illegal dependency that existed in v2.0. All are resolved in v3.0.
-
-```
-v2.0 VIOLATIONS:
-┌──────────────────────────────────────────────────────────────┐
-│  auth/infrastructure/security/SecurityConfig                  │
-│  → governs ALL modules (boundary violation: feature owns      │
-│    cross-cutting concern)                                     │
-├──────────────────────────────────────────────────────────────┤
-│  auth/infrastructure/security/OpenApiConfig                   │
-│  → belongs in shared/config (zero relation to auth security)  │
-├──────────────────────────────────────────────────────────────┤
-│  rbac/application/RoleService → UserJpaRepository             │
-│  → cross-module + cross-layer import (rbac → auth infra)      │
-├──────────────────────────────────────────────────────────────┤
-│  auth/application/AuthService → audit/event/*                 │
-│  rbac/application/RoleService → audit/event/*                 │
-│  → publishers depend on consumer (inverted event ownership)   │
-└──────────────────────────────────────────────────────────────┘
-```
 
 ---
 
 ## 1. Architecture Overview
 
-`auth-spring` is a production-ready authentication and RBAC template. The architecture follows Clean Layered principles with strict dependency inversion. Every class has a single reason to change. The folder structure is the documentation.
+`auth-spring` is a production-ready authentication and RBAC template. The architecture groups all code under a `module/` parent package. Each feature module (`auth`, `rbac`, `audit`) owns its entities, repositories, services, use cases, and web controllers. Cross-cutting infrastructure lives in `shared/`.
 
-### 1.1 Core Design Decisions (v3.0)
+### 1.1 Core Design Decisions
 
 | Decision | Rationale |
 |---|---|
 | Single Maven module | Template scope — multi-module adds Maven reactor complexity with no benefit here |
+| `module/` parent package | Groups all features and shared concerns under one readable root |
 | Feature-based top-level packages | `auth/`, `rbac/`, `audit/` own everything that changes together |
 | `shared/security/` for cross-cutting security | `SecurityConfig` governs all modules — it cannot live inside one |
-| One class per use case in `application/` | Minimal dependencies, targeted testing, clear intent |
-| Port interfaces for cross-module access only | YAGNI for single-module internals; required at module boundaries |
-| Domain value objects for validated concepts | `PermissionName` encodes the format rule; services never see raw strings |
-| Events owned by publisher, consumed by audit | Correct event flow: auth/rbac publish, audit subscribes — never reverse |
+| `service/` for orchestration + infrastructure services | Technology-coupled services (JwtService, TokenBlacklistService) live alongside application orchestration |
+| `usecase/` for pure business logic | One class per use case. Minimal dependencies, targeted testing, clear intent |
+| Direct repository injection in use cases | No port/adapter indirection. Use cases inject Spring Data repositories directly |
+| `entity/event/` events owned by publisher | Events live in the publishing module's `entity/event/` sub-package. `audit` subscribes — never the reverse |
 | Records for all non-entity types | Java 25 records eliminate boilerplate for DTOs, events, value objects, responses |
 | Virtual thread executor for async audit | Project Loom provides lightweight threads; no pool tuning needed |
-| Strategy pattern for `TokenBlacklist` | Swap RDBMS ↔ Redis by changing one property, zero code changes |
-| `UserPrincipal` separate from `UserEntity` | Decouples JPA model from Spring Security; zero DB hit per request |
+| Strategy pattern for `TokenBlacklist` | Internal interface in `auth/service/`. Swap RDBMS ↔ Redis by changing one property |
+| `UserPrincipal` in `shared/security/` | Decouples JPA model from Spring Security; zero DB hit per authenticated request |
 | `ddl-auto: validate` + Liquibase | Liquibase owns schema; Hibernate only validates at startup |
 
-### 1.2 Layer Dependency Rules (v3.0)
+### 1.2 Layer Dependency Rules
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  web/  — HTTP Interface                                       │
-│  Knows about: application/ use cases only                     │
-│  Never imports: infrastructure/, domain/ entities, Security   │
+│  Knows about: usecase/ and service/ classes                   │
+│  Never imports: entity JPA types, Security internals          │
 └──────────────────────────────────────────────────────────────┘
                             ↓ depends on
 ┌──────────────────────────────────────────────────────────────┐
-│  application/  — Use Case Orchestration                       │
-│  Knows about: application/port/ interfaces, domain/, shared/  │
-│  Publishes: ApplicationEvents (one-way, no coupling to audit) │
-│  Never imports: web/, infrastructure/, Spring Security, JJWT  │
+│  usecase/  — Business Logic (one class per use case)         │
+│  Knows about: repository/, service/, shared/                  │
+│  Publishes: ApplicationEvents for side effects               │
+│  Never imports: web/, HttpServletRequest, @Entity             │
 └──────────────────────────────────────────────────────────────┘
                             ↓ depends on
 ┌──────────────────────────────────────────────────────────────┐
-│  domain/  — Business Rules & Value Objects                    │
-│  Knows about: nothing — no Spring, no JPA, no Security        │
-│  Pure Java: validated value objects, domain enums             │
+│  service/  — Orchestration + Infrastructure Services         │
+│  Knows about: repository/, entity/, shared/                   │
+│  Contains: JwtService, TokenBlacklistService, orchestrators  │
 └──────────────────────────────────────────────────────────────┘
-                            ↑ implemented by
+                            ↓ depends on
 ┌──────────────────────────────────────────────────────────────┐
-│  infrastructure/  — Technical Adapters                        │
-│  Knows about: domain/, application/port/, shared/, Spring     │
-│  Contains: JPA entities/repos, JWT, token blacklist, seeding  │
-│  Never imports: web/, other modules' infrastructure/          │
+│  repository/  — Spring Data JPA Interfaces                   │
+│  Knows about: entity/ JPA types only                         │
+│  Never contains: business logic                              │
 └──────────────────────────────────────────────────────────────┘
-                            ↑ both depend on
+                            ↓ depends on
+┌──────────────────────────────────────────────────────────────┐
+│  entity/  — JPA Entities, Enums, Value Objects, Events       │
+│  Knows about: Spring JPA annotations only                    │
+│  entity/event/ — domain event records (publisher-owned)      │
+└──────────────────────────────────────────────────────────────┘
+                            ↑ all layers depend on
 ┌──────────────────────────────────────────────────────────────┐
 │  shared/  — Cross-Cutting Concerns                            │
-│  Knows about: nothing — no feature module imports             │
+│  Knows about: nothing — no feature module imports            │
 │  Contains: config, exceptions, ApiResponse, security filters  │
+│  EXCEPTION: shared/security/ imports auth/service/JwtService │
+│  (filter needs JWT cryptography — documented permitted dep)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -226,176 +86,158 @@ v2.0 VIOLATIONS:
 
 | Rule | Description |
 |---|---|
-| `shared/` is a sink | `shared/` must NEVER import from `auth/`, `rbac/`, or `audit/` |
-| `domain/` is pure | No Spring annotations (`@Component`, `@Service`, etc.), no JPA, no Security |
-| `application/` is technology-free | No `HttpServletRequest`, no `@Entity`, no JJWT, no `@Scheduled` |
-| `web/` only calls application | Controllers never inject repositories, never call `infrastructure/` directly |
-| Cross-module via port only | `rbac` accesses `auth` data **only** through a port interface |
-| Events flow from publisher to audit | `auth/event/` and `rbac/event/` are imported by `audit/`. Never the reverse |
-| Security config is in `shared/` | `SecurityConfig`, `JwtAuthenticationFilter`, `StarterPermissionEvaluator` live in `shared/security/` |
+| `shared/` is a sink | `shared/` must NEVER import from `auth/`, `rbac/`, or `audit/` — except: `shared/security/` may import `auth/service/JwtService` and `auth/service/TokenBlacklist` (filter chain requires these) |
+| `entity/` is persistence-only | No business logic in entities. JPA annotations only. Events are pure records |
+| `usecase/` is technology-light | No `HttpServletRequest`, no `Cookie`. Spring's `@Transactional` is permitted |
+| `web/` only calls use cases and services | Controllers never inject repositories directly |
+| Cross-module repository access is documented | `rbac/service/UserRoleService` and `rbac/seeding/RbacDataSeeder` import `auth/repository/UserRepository`. This is the only permitted cross-module repository dependency |
+| Events flow from publisher to audit | `auth/entity/event/` and `rbac/entity/event/` are imported by `audit/`. Never the reverse |
+| Security config is in `shared/` | `SecurityConfig`, `JwtAuthenticationFilter`, `StarterPermissionEvaluator`, `UserPrincipal` live in `shared/security/` |
 
 ---
 
-## 2. Complete Folder Structure (v3.0)
-
-Every path encodes intent. Reading the path alone tells you what the class does and why it exists.
+## 2. Complete Folder Structure
 
 ```
 auth-spring/
 ├── pom.xml
 ├── README.md
-├── CHANGELOG.md
 │
 └── src/
     ├── main/
     │   ├── java/io/epsilon/auth/
     │   │   ├── AuthSpringApplication.java
     │   │   │
-    │   │   ├── shared/                                   ← CROSS-CUTTING ONLY
-    │   │   │   │                                            zero business logic
-    │   │   │   │                                            zero feature-specific code
-    │   │   │   ├── config/
-    │   │   │   │   ├── AppProperties.java                ← @ConfigurationProperties(prefix=app)
-    │   │   │   │   ├── JpaConfig.java                    ← @EnableJpaAuditing
-    │   │   │   │   ├── JacksonConfig.java                ← ObjectMapper bean
-    │   │   │   │   ├── SchedulingConfig.java             ← @EnableScheduling
-    │   │   │   │   ├── AsyncConfig.java                  ← Virtual thread executor (NEW)
-    │   │   │   │   └── OpenApiConfig.java                ← MOVED from auth/infra/security
-    │   │   │   │
-    │   │   │   ├── exception/                            ← Sealed exception hierarchy
-    │   │   │   │   ├── DomainException.java              ← sealed base
-    │   │   │   │   ├── ResourceNotFoundException.java    ← 404
-    │   │   │   │   ├── EmailAlreadyExistsException.java  ← 409
-    │   │   │   │   ├── AuthException.java                ← 401
-    │   │   │   │   ├── RoleInUseException.java           ← 409
-    │   │   │   │   └── InvalidPermissionNameException.java ← 400
-    │   │   │   │
-    │   │   │   ├── security/                             ← MOVED from auth/infra/security
-    │   │   │   │   │                                        Security is CROSS-CUTTING
-    │   │   │   │   ├── SecurityConfig.java               ← filter chain, CORS, method security
-    │   │   │   │   ├── JwtAuthenticationFilter.java      ← per-request JWT validation
-    │   │   │   │   └── StarterPermissionEvaluator.java   ← @PreAuthorize hasPermission()
-    │   │   │   │
-    │   │   │   └── web/
-    │   │   │       ├── ApiResponse.java                  ← generic envelope record
-    │   │   │       ├── ApiError.java                     ← error detail record
-    │   │   │       ├── GlobalExceptionHandler.java       ← @RestControllerAdvice
-    │   │   │       └── RequestIdFilter.java              ← MDC + X-Request-ID
-    │   │   │
-    │   │   ├── auth/
-    │   │   │   │
-    │   │   │   ├── event/                                ← auth publishes these (NEW location)
-    │   │   │   │   ├── UserRegisteredEvent.java          ← record
-    │   │   │   │   ├── UserLoggedInEvent.java            ← record
-    │   │   │   │   └── UserLoggedOutEvent.java           ← record
-    │   │   │   │
-    │   │   │   ├── application/
-    │   │   │   │   ├── port/                             ← output port interfaces (DIP)
-    │   │   │   │   │   ├── UserPort.java                 ← interface: find/exists/save user
-    │   │   │   │   │   └── RefreshTokenPort.java         ← interface: issue/revoke/validate
-    │   │   │   │   │
-    │   │   │   │   ├── LoginUseCase.java                 ← SPLIT from AuthService
-    │   │   │   │   ├── RegisterUseCase.java              ← SPLIT from AuthService
-    │   │   │   │   ├── LogoutUseCase.java                ← SPLIT from AuthService
-    │   │   │   │   ├── RefreshTokensUseCase.java         ← SPLIT from AuthService
-    │   │   │   │   └── GetProfileUseCase.java            ← SPLIT from AuthService
-    │   │   │   │
-    │   │   │   ├── domain/
-    │   │   │   │   └── UserStatus.java                   ← enum: ACTIVE, LOCKED, EXPIRED
-    │   │   │   │
-    │   │   │   ├── infrastructure/
-    │   │   │   │   ├── persistence/
-    │   │   │   │   │   ├── UserEntity.java               ← @Entity, NO UserDetails
-    │   │   │   │   │   ├── RefreshTokenEntity.java
-    │   │   │   │   │   ├── TokenBlacklistEntry.java
-    │   │   │   │   │   ├── UserJpaRepository.java        ← Spring Data interface
-    │   │   │   │   │   ├── RefreshTokenJpaRepository.java
-    │   │   │   │   │   ├── TokenBlacklistJpaRepository.java
-    │   │   │   │   │   ├── JpaUserAdapter.java           ← implements UserPort
-    │   │   │   │   │   └── JpaRefreshTokenAdapter.java   ← implements RefreshTokenPort
-    │   │   │   │   │
-    │   │   │   │   ├── security/
-    │   │   │   │   │   ├── JwtService.java               ← token issue + parse only
-    │   │   │   │   │   ├── UserPrincipal.java            ← implements UserDetails (adapter)
-    │   │   │   │   │   └── UserDetailsServiceImpl.java   ← login path DB lookup
-    │   │   │   │   │
-    │   │   │   │   └── token/
-    │   │   │   │       ├── TokenBlacklist.java           ← strategy interface
-    │   │   │   │       ├── RdbmsTokenBlacklist.java      ← @ConditionalOnProperty
-    │   │   │   │       ├── RedisTokenBlacklist.java      ← @ConditionalOnProperty
-    │   │   │   │       └── TokenBlacklistPruner.java     ← @Scheduled, SRP
-    │   │   │   │
-    │   │   │   └── web/
-    │   │   │       ├── AuthController.java
-    │   │   │       └── dto/
-    │   │   │           ├── request/
-    │   │   │           │   ├── LoginRequest.java         ← record
-    │   │   │           │   ├── RegisterRequest.java      ← record
-    │   │   │           │   └── RefreshTokenRequest.java  ← record
-    │   │   │           └── response/
-    │   │   │               ├── TokenResponse.java        ← record
-    │   │   │               └── UserProfileResponse.java  ← record
-    │   │   │
-    │   │   ├── rbac/
-    │   │   │   │
-    │   │   │   ├── event/                                ← rbac publishes these (NEW location)
-    │   │   │   │   ├── RoleCreatedEvent.java             ← record
-    │   │   │   │   ├── RoleUpdatedEvent.java             ← record
-    │   │   │   │   ├── RoleDeletedEvent.java             ← record
-    │   │   │   │   └── PermissionAssignedEvent.java      ← record
-    │   │   │   │
-    │   │   │   ├── domain/
-    │   │   │   │   └── PermissionName.java               ← value object, self-validating
-    │   │   │   │
-    │   │   │   ├── application/
-    │   │   │   │   ├── port/
-    │   │   │   │   │   ├── RolePort.java                 ← find/exists/save/delete role
-    │   │   │   │   │   ├── PermissionPort.java           ← find/exists/save/delete permission
-    │   │   │   │   │   └── UserRoleAssignmentPort.java   ← FIX for cross-module access
-    │   │   │   │   │                                        (replaces UserJpaRepository import)
-    │   │   │   │   ├── RoleService.java
-    │   │   │   │   ├── PermissionService.java
-    │   │   │   │   └── UserRoleService.java              ← NEW (was missing)
-    │   │   │   │
-    │   │   │   ├── infrastructure/
-    │   │   │   │   ├── persistence/
-    │   │   │   │   │   ├── RoleEntity.java
-    │   │   │   │   │   ├── PermissionEntity.java
-    │   │   │   │   │   ├── RoleJpaRepository.java
-    │   │   │   │   │   ├── PermissionJpaRepository.java
-    │   │   │   │   │   ├── JpaRoleAdapter.java           ← implements RolePort
-    │   │   │   │   │   └── JpaPermissionAdapter.java     ← implements PermissionPort
-    │   │   │   │   │
-    │   │   │   │   ├── crossmodule/
-    │   │   │   │   │   └── JpaUserRoleAssignmentAdapter.java ← implements UserRoleAssignmentPort
-    │   │   │   │   │                                          uses UserJpaRepository injected here
-    │   │   │   │   │                                          (infra layer → cross-module is OK)
-    │   │   │   │   │
-    │   │   │   │   └── seeding/
-    │   │   │   │       └── RbacDataSeeder.java           ← @Component, ApplicationRunner
-    │   │   │   │
-    │   │   │   └── web/
-    │   │   │       ├── RoleController.java
-    │   │   │       ├── PermissionController.java
-    │   │   │       ├── UserRoleController.java
-    │   │   │       └── dto/
-    │   │   │           ├── request/
-    │   │   │           │   ├── CreateRoleRequest.java
-    │   │   │           │   ├── UpdateRoleRequest.java
-    │   │   │           │   └── CreatePermissionRequest.java
-    │   │   │           └── response/
-    │   │   │               ├── RoleResponse.java
-    │   │   │               └── PermissionResponse.java
-    │   │   │
-    │   │   └── audit/
-    │   │       │                                         ← audit CONSUMES auth + rbac events
-    │   │       ├── application/
-    │   │       │   ├── AuditableEvent.java               ← marker interface
-    │   │       │   └── AuditEventListener.java           ← @EventListener (imports auth/rbac events)
+    │   │   └── module/
     │   │       │
-    │   │       └── infrastructure/
-    │   │           ├── AuditLogEntity.java
-    │   │           └── AuditLogJpaRepository.java
+    │   │       ├── shared/                                   ← CROSS-CUTTING ONLY
+    │   │       │   │                                            zero business logic
+    │   │       │   ├── config/
+    │   │       │   │   ├── AppProperties.java                ← @ConfigurationProperties(prefix=app)
+    │   │       │   │   ├── JpaConfig.java                    ← @EnableJpaAuditing
+    │   │       │   │   ├── JacksonConfig.java                ← ObjectMapper bean
+    │   │       │   │   ├── SchedulingConfig.java             ← @EnableScheduling
+    │   │       │   │   ├── AsyncConfig.java                  ← Virtual thread executor
+    │   │       │   │   └── OpenApiConfig.java                ← API documentation config
+    │   │       │   │
+    │   │       │   ├── exception/                            ← Sealed exception hierarchy
+    │   │       │   │   ├── DomainException.java              ← sealed base
+    │   │       │   │   ├── ResourceNotFoundException.java    ← 404
+    │   │       │   │   ├── EmailAlreadyExistsException.java  ← 409
+    │   │       │   │   ├── AuthException.java                ← 401
+    │   │       │   │   ├── RoleInUseException.java           ← 409
+    │   │       │   │   └── InvalidPermissionNameException.java ← 400
+    │   │       │   │
+    │   │       │   ├── security/                             ← Cross-cutting security
+    │   │       │   │   ├── SecurityConfig.java               ← filter chain, CORS, method security
+    │   │       │   │   ├── JwtAuthenticationFilter.java      ← per-request JWT validation
+    │   │       │   │   ├── StarterPermissionEvaluator.java   ← @PreAuthorize hasPermission()
+    │   │       │   │   └── UserPrincipal.java                ← UserDetails adapter (no DB)
+    │   │       │   │
+    │   │       │   └── web/
+    │   │       │       ├── ApiResponse.java                  ← generic envelope record
+    │   │       │       ├── ApiError.java                     ← error detail record
+    │   │       │       ├── GlobalExceptionHandler.java       ← @RestControllerAdvice
+    │   │       │       └── RequestIdFilter.java              ← MDC + X-Request-ID
+    │   │       │
+    │   │       ├── auth/                                     ← Feature: Authentication
+    │   │       │   │
+    │   │       │   ├── entity/
+    │   │       │   │   ├── UserEntity.java                   ← @Entity, NO UserDetails
+    │   │       │   │   ├── RefreshTokenEntity.java
+    │   │       │   │   ├── TokenBlacklistEntity.java         ← JTI blacklist row
+    │   │       │   │   ├── UserStatus.java                   ← enum: ACTIVE, LOCKED, EXPIRED
+    │   │       │   │   └── event/                            ← auth PUBLISHES these
+    │   │       │   │       ├── UserRegisteredEvent.java      ← record
+    │   │       │   │       ├── UserLoggedInEvent.java        ← record
+    │   │       │   │       └── UserLoggedOutEvent.java       ← record
+    │   │       │   │
+    │   │       │   ├── repository/
+    │   │       │   │   ├── UserRepository.java               ← Spring Data JPA
+    │   │       │   │   ├── RefreshTokenRepository.java
+    │   │       │   │   └── TokenBlacklistRepository.java     ← hot path, indexed
+    │   │       │   │
+    │   │       │   ├── service/
+    │   │       │   │   ├── JwtService.java                   ← token issue + parse only
+    │   │       │   │   ├── TokenBlacklist.java               ← strategy interface (internal)
+    │   │       │   │   ├── RdbmsTokenBlacklistService.java   ← @ConditionalOnProperty(rdbms)
+    │   │       │   │   ├── RedisTokenBlacklistService.java   ← @ConditionalOnProperty(redis)
+    │   │       │   │   ├── TokenBlacklistPruner.java         ← @Scheduled, SRP
+    │   │       │   │   ├── RefreshTokenService.java          ← issue/revoke/hash helpers
+    │   │       │   │   └── UserDetailsServiceImpl.java       ← login path DB lookup
+    │   │       │   │
+    │   │       │   ├── usecase/
+    │   │       │   │   ├── LoginUseCase.java
+    │   │       │   │   ├── RegisterUseCase.java
+    │   │       │   │   ├── LogoutUseCase.java
+    │   │       │   │   ├── RefreshTokensUseCase.java
+    │   │       │   │   └── GetProfileUseCase.java
+    │   │       │   │
+    │   │       │   └── web/
+    │   │       │       ├── AuthController.java
+    │   │       │       └── dto/
+    │   │       │           ├── request/
+    │   │       │           │   ├── LoginRequest.java         ← record
+    │   │       │           │   ├── RegisterRequest.java      ← record
+    │   │       │           │   └── RefreshTokenRequest.java  ← record
+    │   │       │           └── response/
+    │   │       │               ├── TokenResponse.java        ← record
+    │   │       │               └── UserProfileResponse.java  ← record
+    │   │       │
+    │   │       ├── rbac/                                     ← Feature: Roles & Permissions
+    │   │       │   │
+    │   │       │   ├── entity/
+    │   │       │   │   ├── RoleEntity.java
+    │   │       │   │   ├── PermissionEntity.java
+    │   │       │   │   ├── PermissionName.java               ← value object, self-validating
+    │   │       │   │   └── event/                            ← rbac PUBLISHES these
+    │   │       │   │       ├── RoleCreatedEvent.java         ← record
+    │   │       │   │       ├── RoleUpdatedEvent.java         ← record
+    │   │       │   │       ├── RoleDeletedEvent.java         ← record
+    │   │       │   │       └── PermissionAssignedEvent.java  ← record
+    │   │       │   │
+    │   │       │   ├── repository/
+    │   │       │   │   ├── RoleRepository.java
+    │   │       │   │   └── PermissionRepository.java
+    │   │       │   │
+    │   │       │   ├── service/
+    │   │       │   │   ├── RoleService.java                  ← CRUD + permission assignment
+    │   │       │   │   ├── PermissionService.java            ← CRUD with PermissionName validation
+    │   │       │   │   └── UserRoleService.java              ← assign/remove roles from users
+    │   │       │   │
+    │   │       │   ├── usecase/
+    │   │       │   │   ├── AssignRoleUseCase.java            ← thin delegate if needed
+    │   │       │   │   └── ManagePermissionsUseCase.java
+    │   │       │   │
+    │   │       │   ├── web/
+    │   │       │   │   ├── RoleController.java
+    │   │       │   │   ├── PermissionController.java
+    │   │       │   │   ├── UserRoleController.java
+    │   │       │   │   └── dto/
+    │   │       │   │       ├── request/
+    │   │       │   │       │   ├── CreateRoleRequest.java
+    │   │       │   │       │   ├── UpdateRoleRequest.java
+    │   │       │   │       │   └── CreatePermissionRequest.java
+    │   │       │   │       └── response/
+    │   │       │   │           ├── RoleResponse.java
+    │   │       │   │           └── PermissionResponse.java
+    │   │       │   │
+    │   │       │   └── seeding/
+    │   │       │       └── RbacDataSeeder.java               ← @Component, ApplicationRunner
+    │   │       │
+    │   │       └── audit/                                    ← Feature: Audit Logging
+    │   │           │                                            CONSUMES auth + rbac events
+    │   │           ├── entity/
+    │   │           │   └── AuditLogEntity.java
+    │   │           │
+    │   │           ├── repository/
+    │   │           │   └── AuditLogRepository.java
+    │   │           │
+    │   │           ├── service/
+    │   │           │   └── AuditEventListener.java           ← @EventListener, @Async
+    │   │           │
+    │   │           └── usecase/
+    │   │               └── LogAuditEventUseCase.java         ← delegates save to repository
     │   │
     │   └── resources/
     │       ├── application.yml
@@ -414,104 +256,116 @@ auth-spring/
     │               └── 0008_create_audit_log.yaml
     │
     └── test/java/io/epsilon/auth/
-        ├── auth/
-        │   ├── application/            ← LoginUseCaseTest, RegisterUseCaseTest, etc.
-        │   ├── infrastructure/         ← JwtServiceTest, UserPrincipalTest, BlacklistTest
-        │   └── web/                    ← AuthControllerTest
-        ├── rbac/
-        │   ├── application/            ← RoleServiceTest, PermissionServiceTest, UserRoleServiceTest
-        │   ├── domain/                 ← PermissionNameTest (value object validation)
-        │   └── web/                    ← RoleControllerTest, PermissionControllerTest
-        ├── shared/
-        │   └── security/              ← StarterPermissionEvaluatorTest
-        └── integration/
-            ├── AuthFlowIntegrationTest
-            ├── RbacFlowIntegrationTest
-            └── TokenBlacklistIntegrationTest
+        └── module/
+            ├── auth/
+            │   └── test/
+            │       ├── integration/         ← DB, full context tests
+            │       ├── api/                 ← Controller / endpoint tests
+            │       └── unit/                ← Service, usecase, entity tests
+            ├── rbac/
+            │   └── test/
+            │       ├── integration/
+            │       ├── api/
+            │       └── unit/
+            └── audit/
+                └── test/
+                    ├── integration/
+                    ├── api/
+                    └── unit/
 ```
 
 ---
 
 ## 3. Layer Contract Definitions
 
-For each layer the contract is: **what it owns**, **what it must never contain**, and **the test signal** (a failing rule that tells you the code is in the wrong place).
-
 ### 3.1 `shared/` — Cross-Cutting Infrastructure
 
 | Aspect | Contract |
 |---|---|
-| **Owns** | `AppProperties`, config beans (`JpaConfig`, `JacksonConfig`, `SchedulingConfig`, `AsyncConfig`, `OpenApiConfig`), sealed exception hierarchy, `ApiResponse<T>`, `ApiError`, `GlobalExceptionHandler`, `RequestIdFilter`, `SecurityConfig`, `JwtAuthenticationFilter`, `StarterPermissionEvaluator` |
-| **Must NOT contain** | Business logic of any kind, `@Entity`, feature-specific service calls, any import from `auth/`, `rbac/`, or `audit/` |
-| **Test signal** | If a class in `shared/` has an import path containing `auth`, `rbac`, or `audit`, it is in the wrong place |
+| **Owns** | `AppProperties`, config beans, sealed exception hierarchy, `ApiResponse<T>`, `ApiError`, `GlobalExceptionHandler`, `RequestIdFilter`, `SecurityConfig`, `JwtAuthenticationFilter`, `StarterPermissionEvaluator`, `UserPrincipal` |
+| **Must NOT contain** | Business logic, `@Entity`, feature-specific service calls |
+| **Permitted imports** | `shared/security/` may import `auth.module.auth.service.JwtService` and `auth.module.auth.service.TokenBlacklist` (required by `JwtAuthenticationFilter`); also `auth.module.auth.entity.UserEntity` (required by `UserPrincipal.fromEntity()` at login) |
+| **Test signal** | If a class in `shared/` imports from `rbac/` or `audit/`, it is in the wrong place |
 
-### 3.2 `{module}/domain/` — Business Rules
-
-| Aspect | Contract |
-|---|---|
-| **Owns** | Value objects, domain enums, domain-specific validation rules |
-| **Must NOT contain** | `@Component`, `@Service`, `@Entity`, `@Repository`, any Spring annotation, any Jakarta EE import |
-| **Test signal** | If the class has a Spring import, it is not a domain class |
-| **Examples** | `PermissionName` (validates `resource:action` format), `UserStatus` (enum of account states) |
-
-### 3.3 `{module}/application/` — Use Case Orchestration
+### 3.2 `{module}/entity/` — JPA Entities, Value Objects, Events
 
 | Aspect | Contract |
 |---|---|
-| **Owns** | One class per named use case, port interfaces (`application/port/`), internal coordination services |
-| **Calls** | Port interfaces only — never Spring Data repositories directly across module boundaries |
-| **Publishes** | Spring `ApplicationEvent` subclasses for side effects — never calls the side-effector directly |
-| **Must NOT contain** | `HttpServletRequest`, `HttpServletResponse`, `@Entity`, JJWT classes, `@Scheduled`, `Cookie`, any Spring Security class |
-| **Test signal** | If you must mock a Spring Security class to test an application service, the service has a boundary violation |
-| **Transaction rule** | `@Transactional` is permitted here — it is a coordination annotation, not infrastructure logic |
+| **Owns** | JPA `@Entity` classes, enums, value objects (non-entity records), domain event records in `entity/event/` |
+| **Must NOT contain** | `@Component`, `@Service`, business methods, Spring imports |
+| **Test signal** | If an entity has a method that calls a repository or service, it has absorbed business logic |
+| **Examples** | `UserEntity`, `UserStatus`, `PermissionName` (value object), `UserRegisteredEvent` (record) |
 
-### 3.4 `{module}/infrastructure/` — Technical Adapters
+### 3.3 `{module}/repository/` — Data Access
 
 | Aspect | Contract |
 |---|---|
-| **Owns** | JPA entities and repositories, port implementations (`JpaXxxAdapter`), JWT service, security adapters (`UserPrincipal`, `UserDetailsServiceImpl`), token blacklist implementations, data seeders |
-| **Must NOT contain** | Business logic, use case orchestration, controller logic |
-| **Change rule** | A change in any external library (JJWT, Spring Security API, Redis client) must be **entirely contained** inside this layer |
-| **Cross-module infra** | `rbac/infrastructure/crossmodule/` may import `auth/infrastructure/persistence/UserJpaRepository`. This is the **only permitted** cross-module infrastructure dependency and it is one-directional |
+| **Owns** | Spring Data JPA `interface` declarations extending `JpaRepository<T, ID>` |
+| **Must NOT contain** | Business logic, event publishing, service calls |
+| **Change rule** | A change in query logic is the only valid reason to modify a repository |
 
-### 3.5 `{module}/web/` — HTTP Interface
-
-| Aspect | Contract |
-|---|---|
-| **Owns** | `@RestController` classes, Java `record` DTOs for request/response, `@Valid` binding |
-| **Calls** | Only `application/` use case classes |
-| **Must NOT contain** | Business logic, `try-catch` around domain exceptions (those go in `GlobalExceptionHandler`), direct repository access |
-| **Test signal** | If a controller method is longer than 15 lines, it has absorbed logic that belongs in the use case |
-
-### 3.6 `audit/` — Event-Driven Cross-Cutting Concern
+### 3.4 `{module}/service/` — Orchestration and Infrastructure Services
 
 | Aspect | Contract |
 |---|---|
-| **Owns** | `AuditableEvent` marker interface, `AuditEventListener`, `AuditLogEntity`, `AuditLogJpaRepository` |
-| **Imports** | `auth/event/*` and `rbac/event/*` — one-directional, audit depends on publishers |
-| **Must NOT be imported by** | `auth/`, `rbac/` (direction is strictly: publishers → events ← audit) |
-| **Extension** | Add a second `@EventListener` method to `AuditEventListener` for Kafka, Slack, etc. without touching any publisher |
+| **Owns** | Application services that coordinate multiple repositories or infrastructure concerns. Auth-specific infrastructure services: `JwtService`, `TokenBlacklistService`, `RefreshTokenService`, `UserDetailsServiceImpl` |
+| **Calls** | Repositories and other services within the same module, or `shared/` |
+| **Must NOT contain** | `HttpServletRequest`, `Cookie`, `@Scheduled` scheduling logic beyond simple delegation |
+| **Transaction rule** | `@Transactional` is permitted at the service level |
+
+### 3.5 `{module}/usecase/` — Business Logic
+
+| Aspect | Contract |
+|---|---|
+| **Owns** | One class per named use case. Injects only the dependencies it actually needs |
+| **Publishes** | Spring `ApplicationEvent` for side effects — never calls the side-effector directly |
+| **Must NOT contain** | `HttpServletRequest`, `HttpServletResponse`, `Cookie`, Spring Security internals |
+| **Test signal** | If you must mock `HttpServletRequest` to test a use case, it has a boundary violation |
+
+### 3.6 `{module}/web/` — HTTP Interface
+
+| Aspect | Contract |
+|---|---|
+| **Owns** | `@RestController` classes, request/response `record` DTOs |
+| **Calls** | Only `usecase/` and `service/` classes |
+| **Must NOT contain** | Business logic, `try-catch` around domain exceptions, direct repository access |
+| **Test signal** | If a controller method exceeds ~15 lines of meaningful logic, extract to a use case |
+
+### 3.7 `audit/` — Event-Driven Cross-Cutting Concern
+
+| Aspect | Contract |
+|---|---|
+| **Owns** | `AuditEventListener`, `LogAuditEventUseCase`, `AuditLogEntity`, `AuditLogRepository` |
+| **Imports** | `auth/entity/event/*` and `rbac/entity/event/*` — one-directional |
+| **Must NOT be imported by** | `auth/`, `rbac/` — direction is strictly: publishers → events ← audit |
+| **Extension** | Add a Kafka bridge by creating a second `@EventListener` without touching any publisher |
 
 ---
 
 ## 4. Dependency Rules Matrix
 
-✅ = permitted · ❌ = forbidden · ⚠️ = permitted only via port interface
+✅ = permitted · ❌ = forbidden · ⚠️ = permitted (documented cross-module dependency)
 
-| From ↓ / To → | `shared/` | `auth/domain` | `auth/app` | `auth/infra` | `auth/web` | `rbac/domain` | `rbac/app` | `rbac/infra` | `rbac/web` | `audit/` |
+| From ↓ / To → | `shared/` | `auth/entity` | `auth/service` | `auth/repo` | `auth/web` | `rbac/entity` | `rbac/service` | `rbac/repo` | `rbac/web` | `audit/` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `shared/` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `auth/domain` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `auth/app` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `auth/infra` | ✅ | ✅ | ✅ port | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `shared/` | ✅ | ⚠️ UserEntity only | ⚠️ JwtService only | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `auth/entity` | ❌ | ✅ | ❌ | ❌ | ❌ | ⚠️ RoleEntity | ❌ | ❌ | ❌ | ❌ |
+| `auth/service` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `auth/usecase` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ⚠️ RoleRepo | ❌ | ❌ |
 | `auth/web` | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `rbac/domain` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `rbac/app` | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `rbac/infra` | ✅ | ❌ | ❌ | ✅ repo only | ❌ | ✅ | ✅ port | ✅ | ❌ | ❌ |
+| `rbac/entity` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `rbac/service` | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `rbac/service UserRoleService` | ✅ | ✅ | ❌ | ⚠️ UserRepo | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `rbac/usecase` | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | `rbac/web` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ |
-| `audit/app` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| `audit/infra` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `rbac/seeding` | ✅ | ⚠️ UserEntity | ❌ | ⚠️ UserRepo | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ |
+| `audit/service` | ✅ | ✅ events | ❌ | ❌ | ❌ | ✅ events | ❌ | ❌ | ❌ | ✅ |
 
-> **Note on `rbac/infra → auth/infra`:** `JpaUserRoleAssignmentAdapter` in `rbac/infrastructure/crossmodule/` injects `UserJpaRepository` from `auth/infrastructure/persistence/`. This is the only permitted cross-module infrastructure dependency. It is isolated in a dedicated `crossmodule/` sub-package to make the coupling explicit and auditable.
+> **Note on ⚠️ cross-module dependencies:**
+> - `shared/security/UserPrincipal` imports `auth/entity/UserEntity` — required for `fromEntity()` at login. `shared/security/JwtAuthenticationFilter` imports `auth/service/JwtService` and `auth/service/TokenBlacklist` — required by the filter chain. These are the only permitted `shared/` → feature-module imports.
+> - `auth/usecase/RegisterUseCase` imports `rbac/repository/RoleRepository` to look up `ROLE_USER` during registration. This is the only `auth/usecase` → `rbac/repo` dependency.
+> - `rbac/service/UserRoleService` and `rbac/seeding/RbacDataSeeder` import `auth/repository/UserRepository` and `auth/entity/UserEntity` — required for user-role assignment and developer user seeding.
+> - `audit/service/AuditEventListener` imports event records from `auth/entity/event/` and `rbac/entity/event/` — correct event subscription direction.
 
 ---
 
@@ -534,7 +388,7 @@ For each layer the contract is: **what it owns**, **what it must never contain**
 | `GET` | `/api/roles` | `role:read` | Paginated list of all roles |
 | `GET` | `/api/roles/{id}` | `role:read` | Get role by UUID |
 | `POST` | `/api/roles` | `role:create` | Create new role |
-| `PUT` | `/api/roles/{id}` | `role:update` | Update role name/description |
+| `PUT` | `/api/roles/{id}` | `role:update` | Update role description (name is immutable after creation) |
 | `DELETE` | `/api/roles/{id}` | `role:delete` | Delete role (fails if role is assigned to any user) |
 | `POST` | `/api/roles/{roleId}/permissions/{permId}` | `role:update` | Assign permission to role |
 | `DELETE` | `/api/roles/{roleId}/permissions/{permId}` | `role:update` | Remove permission from role |
@@ -625,14 +479,14 @@ otherwise                                 → DENIED
 |---|---|---|
 | `0001_create_users` | `auth_users` | `id UUID PK`, `email VARCHAR UNIQUE NOT NULL`, `password_hash`, `enabled BOOL DEFAULT true`, `account_non_locked`, `account_non_expired`, `credentials_non_expired`, `created_at`/`updated_at TIMESTAMPTZ` |
 | `0002_create_roles` | `auth_roles` | `id UUID PK`, `name VARCHAR(100) UNIQUE NOT NULL`, `description VARCHAR(500)` |
-| `0003_create_permissions` | `auth_permissions` | `id UUID PK`, `name VARCHAR(100) UNIQUE NOT NULL`. **DB-level CHECK**: `name ~ '^[a-z_]+:[a-z_*]+$'` (second line of defence after domain validation) |
+| `0003_create_permissions` | `auth_permissions` | `id UUID PK`, `name VARCHAR(100) UNIQUE NOT NULL`. **DB-level CHECK**: `name ~ '^[a-z_]+:[a-z_*]+$'` (second line of defence after `PermissionName` validation) |
 | `0004_create_user_roles` | `auth_user_roles` | Composite PK `(user_id, role_id)`. FK → `auth_users ON DELETE CASCADE`. FK → `auth_roles ON DELETE RESTRICT` |
 | `0005_create_role_permissions` | `auth_role_permissions` | Composite PK `(role_id, permission_id)`. FK → `auth_roles ON DELETE CASCADE`. FK → `auth_permissions ON DELETE RESTRICT` |
 | `0006_create_refresh_tokens` | `auth_refresh_tokens` | `id UUID PK`, `token_hash VARCHAR(64) UNIQUE`, `user_id FK`, `issued_at`, `expires_at`, `revoked_at NULLABLE`, `device_fingerprint VARCHAR(255)` |
 | `0007_create_token_blacklist` | `auth_token_blacklist` | `id UUID PK`, `jti VARCHAR(36)`, `expires_at TIMESTAMPTZ`. **Composite index** `idx_blacklist_jti_expires (jti, expires_at)` — hot path for every authenticated request |
 | `0008_create_audit_log` | `auth_audit_log` | `id UUID PK`, `event_type VARCHAR(50) NOT NULL`, `actor_id UUID`, `target_id UUID`, `ip_address VARCHAR(45)`, `metadata JSONB`, `occurred_at TIMESTAMPTZ NOT NULL`. **Indexes**: `idx_audit_actor (actor_id, occurred_at)`, `idx_audit_type (event_type, occurred_at)` |
 
-> Note on `auth_audit_log.metadata`: Changed from `TEXT` to `JSONB` in v3.0. Enables server-side JSON queries and eliminates string-concatenation injection. Requires `ObjectMapper` usage in `AuditEventListener`.
+> `auth_audit_log.metadata` is `JSONB` — enables server-side JSON queries and eliminates string-concatenation injection. Requires `ObjectMapper` usage in `AuditEventListener`.
 
 ---
 
@@ -654,7 +508,7 @@ Client
   │     │     │         → UserPrincipal.fromEntity()
   │     │     │
   │     │     ├─ JwtService.issueAccessToken()
-  │     │     ├─ RefreshTokenPort.issue()
+  │     │     ├─ RefreshTokenService.issue()
   │     │     └─ publish UserLoggedInEvent
   │     │
   │     └─ Returns: {accessToken, refreshToken} + HttpOnly cookie
@@ -753,34 +607,32 @@ public sealed class DomainException extends RuntimeException
 
 ### 9.3 Records Replace Lombok for Non-Entity Types
 
-All DTOs, response objects, domain events, and value objects are Java `record` types. Lombok is retained only for JPA entities (which require mutable state, no-arg constructors, and `equals`/`hashCode` based on `id` only — patterns that records do not fit).
+All DTOs, response objects, domain events, and value objects are Java `record` types. Lombok is retained only for JPA entities (which require mutable state, no-arg constructors, and `equals`/`hashCode` based on `id` only).
 
 ### 9.4 Pattern Matching in GlobalExceptionHandler
 
 ```java
 // Java 25 pattern matching switch in exception handler
-private int statusFor(DomainException ex) {
-    return switch (ex) {
-        case AuthException e           -> 401;
-        case ResourceNotFoundException e -> 404;
-        case EmailAlreadyExistsException e,
-             RoleInUseException e      -> 409;
-        case InvalidPermissionNameException e -> 400;
-    };
-}
+HttpStatus status = switch (ex) {
+    case AuthException e                  -> HttpStatus.UNAUTHORIZED;
+    case ResourceNotFoundException e      -> HttpStatus.NOT_FOUND;
+    case EmailAlreadyExistsException e    -> HttpStatus.CONFLICT;
+    case RoleInUseException e             -> HttpStatus.CONFLICT;
+    case InvalidPermissionNameException e -> HttpStatus.BAD_REQUEST;
+};
 ```
 
 ---
 
-## 10. SOLID Principles Map (v3.0)
+## 10. SOLID Principles Map
 
 | Principle | Concrete Location in Codebase |
 |---|---|
-| **S — Single Responsibility** | `LoginUseCase` handles only login. `LogoutUseCase` handles only logout. `JwtService` handles only token cryptography. `TokenBlacklistPruner` handles only expired-entry cleanup. `RbacDataSeeder` handles only bootstrap seeding. No class has more than one reason to change |
-| **O — Open/Closed** | `TokenBlacklist`: add `MemcachedTokenBlacklist` by implementing the interface and adding `@ConditionalOnProperty`. No existing class changes. `AuditEventListener`: add a Kafka bridge by adding a second `@EventListener` method |
-| **L — Liskov Substitution** | `RdbmsTokenBlacklist` and `RedisTokenBlacklist` are fully substitutable. `JpaUserAdapter` and any future `MongoUserAdapter` implement `UserPort` — callers in `application/` behave identically regardless of which adapter is active |
-| **I — Interface Segregation** | `TokenBlacklist` has exactly 2 methods. `UserPort` exposes only what `application/` needs from users. `UserRoleAssignmentPort` exposes only the one method `rbac` needs. `AuditableEvent` is a pure marker |
-| **D — Dependency Inversion** | `LoginUseCase` depends on `UserPort` and `RefreshTokenPort` (abstractions). `RoleService` depends on `UserRoleAssignmentPort` (not `UserJpaRepository`). All `application/` classes depend on port interfaces — never on JPA concrete classes |
+| **S — Single Responsibility** | `LoginUseCase` handles only login. `LogoutUseCase` handles only logout. `JwtService` handles only token cryptography. `TokenBlacklistPruner` handles only expired-entry cleanup. `RbacDataSeeder` handles only bootstrap seeding |
+| **O — Open/Closed** | `TokenBlacklist`: add `RedisTokenBlacklistService` by implementing the interface and adding `@ConditionalOnProperty`. No existing class changes. `AuditEventListener`: add a Kafka bridge by adding a second `@EventListener` method |
+| **L — Liskov Substitution** | `RdbmsTokenBlacklistService` and `RedisTokenBlacklistService` are fully substitutable. Callers in `usecase/` behave identically regardless of which implementation is active |
+| **I — Interface Segregation** | `TokenBlacklist` has exactly 2 methods. Each repository interface exposes only what its callers need. No interface carries unrelated methods |
+| **D — Dependency Inversion** | `LoginUseCase` depends on `JwtService` and `RefreshTokenService` (Spring-managed beans abstracted by type). `LogoutUseCase` depends on `TokenBlacklist` (interface). `PermissionService` depends on `PermissionName` value object — never on raw strings |
 
 ---
 
@@ -792,10 +644,10 @@ None of these require modifying existing source files.
 |---|---|
 | New blacklist strategy | Implement `TokenBlacklist`, add `@ConditionalOnProperty`. Zero changes to filter or use cases |
 | New audit event consumer | Add `@EventListener` method to `AuditEventListener`, or create a new `@EventListener` class for Kafka/Slack |
-| New domain events | Add a record to the publishing module's `event/` package, publish from use case, add handler to `AuditEventListener` |
+| New domain events | Add a record to the publishing module's `entity/event/` package, publish from use case, add handler to `AuditEventListener` |
 | New permissions | Add to `RbacDataSeeder.seedPermissions()`. `ROLE_DEVELOPER` receives them via `all:all` automatically |
-| Custom user fields | Add Liquibase changeset + update `UserEntity` + update `UserPort` method return type if needed |
+| Custom user fields | Add Liquibase changeset + update `UserEntity`. Use cases accessing the new field update accordingly |
 | Rate limiting | Add a `HandlerInterceptor` bean — injection point in filter chain is ready in `SecurityConfig` |
-| OAuth2 / Social login | Add `spring-boot-starter-oauth2-client` + `auth/infrastructure/oauth/` package |
-| Device fingerprinting | Populate `RefreshTokenEntity.deviceFingerprint` from `HttpServletRequest` in `RegisterUseCase` or `LoginUseCase` |
-| MFA (TOTP) | Add `auth/infrastructure/mfa/TotpService`, a new `MfaChallengeUseCase`, and a `/api/auth/mfa/verify` endpoint |
+| OAuth2 / Social login | Add `spring-boot-starter-oauth2-client` + `auth/service/oauth/` package |
+| Device fingerprinting | Populate `RefreshTokenEntity.deviceFingerprint` from `HttpServletRequest` in `AuthController` before passing to `RefreshTokenService` |
+| MFA (TOTP) | Add `auth/service/TotpService`, a new `MfaChallengeUseCase`, and a `/api/auth/mfa/verify` endpoint |
