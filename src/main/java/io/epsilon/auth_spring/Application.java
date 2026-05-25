@@ -2,8 +2,9 @@ package io.epsilon.auth_spring;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;  // <-- new import
-
+@ConfigurationPropertiesScan
 @SpringBootApplication(exclude = {DataSourceAutoConfiguration.class})
 public class Application {
 	static void main(String[] args) {
