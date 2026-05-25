@@ -5,10 +5,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration; // Add this line
 
 @SpringBootApplication(exclude = {DataSourceAutoConfiguration.class})
-public class AuthSpringApplication {
+public class Application {
 
-	public static void main(String[] args) {
-		SpringApplication.run(AuthSpringApplication.class, args);
+	static void main(String[] args) {
+		SpringApplication.run(Application.class, args);
 	}
 
 }
